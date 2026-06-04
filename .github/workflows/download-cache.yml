@@ -21,6 +21,7 @@ jobs:
         uses: "actions/checkout@v4"
         with:
           repository: crazywhalecc/static-php-cli
+          ref: main
 
       - name: "Create Matrix Variable"
         id: step1
@@ -45,6 +46,7 @@ jobs:
         uses: "actions/checkout@v4"
         with:
           repository: crazywhalecc/static-php-cli
+          ref: main
       - name: "Setup static-php environment"
         run: |
           bin/setup-runtime
@@ -119,6 +121,7 @@ jobs:
         uses: "actions/checkout@v4"
         with:
           repository: crazywhalecc/static-php-cli
+          ref: main
       - name: "Setup static-php environment"
         run: |
           bin/setup-runtime
