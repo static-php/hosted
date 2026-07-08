@@ -1,9 +1,12 @@
-name: Build Self-Hosted PHP Binary (Unix)
+name: "[v3] Build Self-Hosted PHP Binary (Unix)"
 
 on:
   workflow_dispatch:
   schedule:
     - cron: "0 1 */3 * *"
+
+env:
+  GITHUB_TOKEN: ${{ secrets.S_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
 
 jobs:
   build-release-artifacts:
@@ -13,7 +16,6 @@ jobs:
       fail-fast: false
       matrix:
         php-version:
-          # - "8.1"
           - "8.2"
           - "8.3"
           - "8.4"
@@ -41,72 +43,76 @@ jobs:
           - { runner: "ubuntu-22.04-arm", combination: "minimal" }
           - { runner: "ubuntu-22.04-arm", combination: "bulk" }
           - { runner: "ubuntu-22.04-arm", combination: "common" }
+
     steps:
       - name: "Process env string"
         id: process-env
         shell: bash
         run: |
           case "${{ matrix.combination }}" in
-            minimal) 
+            minimal)
               echo "EXTENSIONS=iconv,pcntl,posix,mbstring,filter,tokenizer,phar" >> "$GITHUB_OUTPUT"
               ;;
-            common)  
+            common)
               echo "EXTENSIONS=bcmath,bz2,calendar,ctype,curl,dom,exif,fileinfo,filter,ftp,gd,gmp,iconv,xml,mbstring,mbregex,mysqlnd,openssl,pcntl,pdo,pdo_mysql,pdo_sqlite,pdo_pgsql,pgsql,phar,posix,redis,session,simplexml,soap,sockets,sqlite3,tokenizer,xmlwriter,xmlreader,zlib,zip" >> "$GITHUB_OUTPUT"
-              echo "SUGGEST=--with-suggested-libs" >> "$GITHUB_OUTPUT"
+              echo "SUGGEST=--with-suggests" >> "$GITHUB_OUTPUT"
               ;;
-            bulk|gnu-bulk)    
+            bulk|gnu-bulk)
               echo "EXTENSIONS=apcu,bcmath,bz2,calendar,ctype,curl,dba,dom,event,exif,fileinfo,filter,ftp,gd,gmp,iconv,imagick,imap,intl,mbregex,mbstring,mysqli,mysqlnd,opcache,openssl,opentelemetry,pcntl,pdo,pdo_mysql,pgsql,phar,posix,protobuf,readline,redis,session,shmop,simplexml,soap,sockets,sodium,sqlite3,swoole,swoole-hook-mysql,swoole-hook-pgsql,swoole-hook-sqlite,sysvmsg,sysvsem,sysvshm,tokenizer,xml,xmlreader,xmlwriter,xsl,zip,zlib" >> "$GITHUB_OUTPUT"
-              echo "SUGGEST=--with-suggested-libs" >> "$GITHUB_OUTPUT"
+              echo "SUGGEST=--with-suggests" >> "$GITHUB_OUTPUT"
               ;;
           esac
-          
+
+          echo "CMD=bin/spc" >> "$GITHUB_OUTPUT"
+
           case "${{ matrix.runner }}" in
             ubuntu-latest)
               echo "OS=linux" >> "$GITHUB_OUTPUT"
               echo "ARCH=x86_64" >> "$GITHUB_OUTPUT"
-              echo "CMD=bin/spc-alpine-docker" >> "$GITHUB_OUTPUT"
+              echo "UPX=--with-upx-pack" >> "$GITHUB_OUTPUT"
               ;;
             ubuntu-24.04-arm)
               echo "OS=linux" >> "$GITHUB_OUTPUT"
               echo "ARCH=aarch64" >> "$GITHUB_OUTPUT"
-              echo CMD="bin/spc-alpine-docker" >> "$GITHUB_OUTPUT"
+              echo "UPX=--with-upx-pack" >> "$GITHUB_OUTPUT"
               ;;
             ubuntu-22.04)
               echo "OS=linux" >> "$GITHUB_OUTPUT"
               echo "ARCH=x86_64" >> "$GITHUB_OUTPUT"
-              echo CMD="bin/spc-gnu-docker" >> "$GITHUB_OUTPUT"
+              echo "SPC_TARGET=native-native-gnu.2.17" >> "$GITHUB_OUTPUT"
               ;;
             ubuntu-22.04-arm)
               echo "OS=linux" >> "$GITHUB_OUTPUT"
               echo "ARCH=aarch64" >> "$GITHUB_OUTPUT"
-              echo CMD="bin/spc-gnu-docker" >> "$GITHUB_OUTPUT"
-              ;;
-            windows-2019)
-              echo "OS=windows" >> "$GITHUB_OUTPUT"
-              echo "ARCH=x86_64" >> "$GITHUB_OUTPUT"
-              echo "CMD=bin/spc" >> "$GITHUB_OUTPUT"
+              echo "SPC_TARGET=native-native-gnu.2.17" >> "$GITHUB_OUTPUT"
               ;;
             macos-15-intel)
               echo "OS=macos" >> "$GITHUB_OUTPUT"
               echo "ARCH=x86_64" >> "$GITHUB_OUTPUT"
-              echo "CMD=bin/spc" >> "$GITHUB_OUTPUT"
               ;;
             macos-15)
               echo "OS=macos" >> "$GITHUB_OUTPUT"
               echo "ARCH=aarch64" >> "$GITHUB_OUTPUT"
-              echo "CMD=bin/spc" >> "$GITHUB_OUTPUT"
               ;;
           esac
-      
+
+      - name: "Checkout current repository"
+        if: github.repository == 'crazywhalecc/static-php-cli'
+        uses: actions/checkout@v4
+
       - name: "Checkout remote"
         if: github.repository != 'crazywhalecc/static-php-cli'
         uses: actions/checkout@v4
         with:
           repository: crazywhalecc/static-php-cli
-          ref: main
+          ref: v3
+
+      - name: "Apply target env"
+        if: ${{ steps.process-env.outputs.SPC_TARGET != '' }}
+        shell: bash
+        run: echo "SPC_TARGET=${{ steps.process-env.outputs.SPC_TARGET }}" >> "$GITHUB_ENV"
 
       - name: "Setup PHP"
-        if: ${{ !startsWith(matrix.runner, 'ubuntu') }}
         uses: shivammathur/setup-php@v2
         with:
           php-version: 8.4
@@ -115,7 +121,6 @@ jobs:
           ini-values: memory_limit=-1
 
       - name: "Cache composer packages"
-        id: composer-cache
         uses: actions/cache@v4
         with:
           path: vendor
@@ -123,69 +128,72 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-php
 
-      # Cache downloaded source
-      - id: cache-download
+      - name: "Cache downloaded artifacts"
         uses: actions/cache@v4
         with:
           path: downloads
-          key: pack-lib-dependencies-${{ matrix.combination }}-${{ matrix.php-version }}-${{ matrix.runner }}
+          key: v3-php-bin-${{ matrix.combination }}-${{ matrix.php-version }}-${{ matrix.runner }}
 
       - name: "Install Dependencies"
-        if: ${{ !startsWith(matrix.runner, 'ubuntu') }}
         run: composer update -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist --no-dev
 
-      - run: ${{ steps.process-env.outputs.CMD }} doctor --auto-fix
+      - name: "Run Build Tests (doctor)"
+        run: ${{ steps.process-env.outputs.CMD }} doctor --auto-fix
 
-      - name: "ACLOCAL"
+      - name: "Install UPX"
+        if: ${{ steps.process-env.outputs.UPX != '' }}
+        run: ${{ steps.process-env.outputs.CMD }} install-pkg upx
+
+      - name: "Build PHP"
+        shell: bash
         run: |
-          autoconf --version
-          aclocal --print-ac-dir
-          echo $ACLOCAL_PATH
+          ${{ steps.process-env.outputs.CMD }} build \
+            --build-cli \
+            --build-micro \
+            --build-fpm \
+            "${{ steps.process-env.outputs.EXTENSIONS }}" \
+            --debug \
+            ${{ steps.process-env.outputs.UPX }} \
+            ${{ steps.process-env.outputs.SUGGEST }} \
+            --dl-with-php="${{ matrix.php-version }}" \
+            --dl-retry=5 \
+            --dl-prefer-binary \
+            --dl-ignore-cache=php-src
 
-      # If there's no dependencies cache, fetch sources
-      - name: "Download sources"
-        env:
-          GITHUB_TOKEN: ${{ secrets.S_GITHUB_TOKEN }}
-        run: ${{ steps.process-env.outputs.CMD }} download --with-php=${{ matrix.php-version }} --for-extensions=${{ steps.process-env.outputs.EXTENSIONS }} --retry=5 --prefer-pre-built --ignore-cache-sources=php-src
-
-      - name: "Build library: ${{ matrix.library }}"
+      - name: "Pack PHP"
+        shell: bash
         run: |
-          if [ "${{ steps.process-env.outputs.OS }}" = "linux" ] && [ "${{ steps.process-env.outputs.CMD }}" = "bin/spc-alpine-docker" ]; then
-            ${{ steps.process-env.outputs.CMD }} install-pkg upx
-            UPX=--with-upx-pack
-          fi
-          
-          ${{ steps.process-env.outputs.CMD }} build --build-cli --build-micro --build-fpm ${{ steps.process-env.outputs.EXTENSIONS }} --debug $UPX ${{ steps.process-env.outputs.SUGGEST }}
+          mkdir -p tmp_dist dist
 
-          # Copy out from buildroot, because docker build has different permission
-          mkdir -p tmp_dist/
           cp buildroot/bin/php tmp_dist/
           cp buildroot/bin/micro.sfx tmp_dist/
           cp buildroot/bin/php-fpm tmp_dist/
 
-          PHPVER=$(cat source/php-src/main/php_version.h | grep "PHP_VERSION " | awk -F\" '{print $2}')
-          
-          if [ ! -d "dist" ]; then
-            mkdir dist/
+          ${{ steps.process-env.outputs.CMD }} dev:info php --json --no-ansi > php-info.json
+          PHPVER="$(php -r '$j = json_decode(file_get_contents("php-info.json"), true); echo $j["cache"]["source"]["info"]["version"] ?? "";')"
+          if [ -z "$PHPVER" ]; then
+            echo "Cannot resolve PHP version from dev:info php --json"
+            exit 1
           fi
 
-          sudo chmod -R 777 dist
-          
-          tar -czf dist/php-$PHPVER-cli-${{ steps.process-env.outputs.OS }}-${{ steps.process-env.outputs.ARCH }}.tar.gz -C tmp_dist/ php
-          tar -czf dist/php-$PHPVER-micro-${{ steps.process-env.outputs.OS }}-${{ steps.process-env.outputs.ARCH }}.tar.gz -C tmp_dist/ micro.sfx
-          tar -czf dist/php-$PHPVER-fpm-${{ steps.process-env.outputs.OS }}-${{ steps.process-env.outputs.ARCH }}.tar.gz -C tmp_dist/ php-fpm
-          if [ "${{ matrix.php-version }}" == "8.4" ] && [ "${{ matrix.runner }}" == "ubuntu-latest" ]; then
-            cp -r buildroot/license dist/
-            cp buildroot/build-extensions.json dist/
-            cp buildroot/build-libraries.json dist/
-            echo -e "# Note\n\nCurrent distribution uses extensions:\n\n${{ steps.process-env.outputs.EXTENSIONS }}\n\nUsing compile command:\n\n  bin/spc build --build-cli --build-micro --build-fpm ${{ steps.process-env.outputs.EXTENSIONS }} --debug --with-upx-pack" > dist/README.txt
-          fi
-          if [ "${{ matrix.php-version }}" == "8.4" ] && [ "${{ matrix.runner }}" == "ubuntu-22.04" ]; then
-            cp -r buildroot/license dist/
-            cp buildroot/build-extensions.json dist/
-            cp buildroot/build-libraries.json dist/
-            echo -e "# Note\n\nCurrent distribution uses extensions:\n\n${{ steps.process-env.outputs.EXTENSIONS }}\n\nUsing compile command:\n\n  bin/spc build --build-cli --build-micro --build-fpm ${{ steps.process-env.outputs.EXTENSIONS }} --debug --with-upx-pack" > dist/README.txt
-          fi
+          chmod -R 755 tmp_dist
+          sudo chmod -R 777 dist || true
+
+          tar -czf "dist/php-$PHPVER-cli-${{ steps.process-env.outputs.OS }}-${{ steps.process-env.outputs.ARCH }}.tar.gz" -C tmp_dist/ php
+          tar -czf "dist/php-$PHPVER-micro-${{ steps.process-env.outputs.OS }}-${{ steps.process-env.outputs.ARCH }}.tar.gz" -C tmp_dist/ micro.sfx
+          tar -czf "dist/php-$PHPVER-fpm-${{ steps.process-env.outputs.OS }}-${{ steps.process-env.outputs.ARCH }}.tar.gz" -C tmp_dist/ php-fpm
+
+          echo "PHPVER=$PHPVER" >> "$GITHUB_ENV"
+          ls -la dist
+
+      - name: "Add build metadata"
+        if: ${{ matrix.php-version == '8.4' && (matrix.runner == 'ubuntu-latest' || matrix.runner == 'ubuntu-22.04') }}
+        shell: bash
+        run: |
+          cp -r buildroot/license dist/
+          cp buildroot/build-extensions.json dist/
+          cp buildroot/build-libraries.json dist/
+          echo -e "# Note\n\nCurrent distribution uses extensions:\n\n${{ steps.process-env.outputs.EXTENSIONS }}\n\nUsing compile command:\n\n  ${{ steps.process-env.outputs.CMD }} build --build-cli --build-micro --build-fpm \"${{ steps.process-env.outputs.EXTENSIONS }}\" --debug ${{ steps.process-env.outputs.UPX }} ${{ steps.process-env.outputs.SUGGEST }} --dl-with-php=\"${{ matrix.php-version }}\" --dl-retry=5 --dl-prefer-binary --dl-ignore-cache=php-src\n\nSPC_TARGET:\n\n  ${SPC_TARGET:-default}" > dist/README.txt
 
       - name: "Deploy to self-hosted OSS"
         uses: static-php/upload-s3-action@v1.0.0
@@ -194,15 +202,23 @@ jobs:
           aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws_bucket: ${{ secrets.AWS_BUCKET }}
           source_dir: "dist/"
-          destination_dir: static-php-cli/${{ matrix.combination }}/
+          destination_dir: v3/php-bin/${{ matrix.combination }}/
           endpoint: ${{ secrets.AWS_ENDPOINT }}
 
       - name: "Upload Artifact"
         uses: actions/upload-artifact@v4
         with:
-          name: php-${{ matrix.php-version }}-${{ matrix.combination }}-${{ steps.process-env.outputs.OS }}-${{ steps.process-env.outputs.ARCH }}
+          name: php-${{ env.PHPVER }}-${{ matrix.combination }}-${{ steps.process-env.outputs.OS }}-${{ steps.process-env.outputs.ARCH }}
           path: |
             tmp_dist/php
             tmp_dist/php-fpm
             tmp_dist/micro.sfx
           if-no-files-found: error
+
+      - name: "Upload logs on failure"
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: spc-logs-${{ matrix.php-version }}-${{ matrix.combination }}-${{ matrix.runner }}
+          path: log/*.log
+          if-no-files-found: ignore
