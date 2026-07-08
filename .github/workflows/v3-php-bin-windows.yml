@@ -22,7 +22,7 @@ jobs:
         combination:
           - spc-min
           - spc-max
-    
+
     steps:
       - name: "Process env string"
         id: process-env
@@ -36,8 +36,8 @@ jobs:
                 Add-Content -Path $env:GITHUB_OUTPUT -Value "EXTENSIONS=amqp,apcu,bcmath,bz2,calendar,ctype,curl,dba,dom,ds,exif,ffi,fileinfo,filter,ftp,gd,iconv,igbinary,libxml,mbregex,mbstring,mysqli,mysqlnd,opcache,openssl,pdo,pdo_mysql,pdo_sqlite,pdo_sqlsrv,phar,rar,redis,session,shmop,simdjson,simplexml,soap,sockets,sqlite3,sqlsrv,ssh2,sysvshm,tokenizer,xml,xmlreader,xmlwriter,yac,yaml,zip,zlib"
                 Add-Content -Path $env:GITHUB_OUTPUT -Value "DEPLOY_TARGET=${{ secrets.DEPLOY_SERVER_TARGET_WINDOWS_SPC_MAX }}"
             }
-          }  
-        
+          }
+
           switch ("${{ matrix.runner }}") {
               "windows-latest" {
                   Add-Content -Path $env:GITHUB_OUTPUT -Value "OS=windows"
@@ -45,7 +45,7 @@ jobs:
                   Add-Content -Path $env:GITHUB_OUTPUT -Value "CMD=bin/spc"
               }
           }
-            
+
       - name: "Checkout remote"
         if: github.repository != 'crazywhalecc/static-php-cli'
         uses: actions/checkout@v4
@@ -70,7 +70,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-php
 
-      # Cache downloaded source
       - id: cache-download
         uses: actions/cache@v4
         with:
@@ -92,11 +91,16 @@ jobs:
         run: ${{ steps.process-env.outputs.CMD }} install-pkg upx
 
       - name: "Build extensions: ${{ steps.process-env.outputs.EXTENSIONS }}"
-        run: ${{ steps.process-env.outputs.CMD }} build --build-cli --build-micro "${{ steps.process-env.outputs.EXTENSIONS }}" --debug --with-upx-pack
+        run: ${{ steps.process-env.outputs.CMD }} build --build-cli --build-micro "${{ steps.process-env.outputs.EXTENSIONS }}" --debug --with-upx-pack --dl-with-php="${{ matrix.php-version }}"
 
       - name: "Pack PHP"
         run: |
-          $PHPVER = ${{ steps.process-env.outputs.CMD }} dev:php-ver
+          $PHPINFO = ${{ steps.process-env.outputs.CMD }} dev:info php --json --no-ansi | ConvertFrom-Json
+          $PHPVER = $PHPINFO.cache.source.info.version
+          if (-not $PHPVER) {
+            throw "Cannot resolve PHP version from dev:info php --json"
+          }
+
           New-Item -ItemType Directory -Force -Path dist
           Compress-Archive -Path "buildroot\bin\php.exe" -DestinationPath "dist\php-$PHPVER-cli-win.zip"
           Compress-Archive -Path "buildroot\bin\micro.sfx" -DestinationPath "dist\php-$PHPVER-micro-win.zip"
@@ -107,8 +111,8 @@ jobs:
         if: ${{ matrix.php-version == '8.4' }}
         shell: bash
         run: |
-          echo -e "# Note\n\nCurrent distribution uses extensions:\n\n${{ steps.process-env.outputs.EXTENSIONS }}\n\nUsing compile command:\n\n  bin/spc build --build-cli --build-micro \"${{ steps.process-env.outputs.EXTENSIONS }}\" --debug --with-upx-pack" > dist/README.txt
-          
+          echo -e "# Note\n\nCurrent distribution uses extensions:\n\n${{ steps.process-env.outputs.EXTENSIONS }}\n\nUsing compile command:\n\n  bin/spc build --build-cli --build-micro \"${{ steps.process-env.outputs.EXTENSIONS }}\" --debug --with-upx-pack --dl-with-php=\"${{ matrix.php-version }}\"" > dist/README.txt
+
       - name: "Deploy to self-hosted OSS"
         uses: static-php/upload-s3-action@v1.0.0
         with:
@@ -127,4 +131,3 @@ jobs:
             buildroot/bin/php.exe
             buildroot/bin/micro.sfx
           if-no-files-found: error
-          
