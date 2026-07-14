@@ -191,8 +191,7 @@ jobs:
         shell: bash
         run: |
           cp -r buildroot/license dist/
-          cp buildroot/build-extensions.json dist/
-          cp buildroot/build-libraries.json dist/
+          cp buildroot/build-manifest.json dist/
           echo -e "# Note\n\nCurrent distribution uses extensions:\n\n${{ steps.process-env.outputs.EXTENSIONS }}\n\nUsing compile command:\n\n  ${{ steps.process-env.outputs.CMD }} build --build-cli --build-micro --build-fpm \"${{ steps.process-env.outputs.EXTENSIONS }}\" --debug ${{ steps.process-env.outputs.UPX }} ${{ steps.process-env.outputs.SUGGEST }} --dl-with-php=\"${{ matrix.php-version }}\" --dl-retry=5 --dl-prefer-binary --dl-ignore-cache=php-src\n\nSPC_TARGET:\n\n  ${SPC_TARGET:-default}" > dist/README.txt
 
       - name: "Deploy to self-hosted OSS"
