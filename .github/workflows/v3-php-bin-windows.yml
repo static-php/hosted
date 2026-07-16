@@ -91,7 +91,7 @@ jobs:
         run: ${{ steps.process-env.outputs.CMD }} install-pkg upx
 
       - name: "Build extensions: ${{ steps.process-env.outputs.EXTENSIONS }}"
-        run: ${{ steps.process-env.outputs.CMD }} build --build-cli --build-micro "${{ steps.process-env.outputs.EXTENSIONS }}" --debug --with-upx-pack --dl-with-php="${{ matrix.php-version }}"
+        run: ${{ steps.process-env.outputs.CMD }} build --build-cli --build-micro "${{ steps.process-env.outputs.EXTENSIONS }}" --debug --with-upx-pack --dl-with-php="${{ matrix.php-version }}" --dl-retry=5
 
       - name: "Pack PHP"
         run: |
