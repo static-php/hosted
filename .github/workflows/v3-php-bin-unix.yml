@@ -79,12 +79,12 @@ jobs:
             ubuntu-22.04)
               echo "OS=linux" >> "$GITHUB_OUTPUT"
               echo "ARCH=x86_64" >> "$GITHUB_OUTPUT"
-              echo "SPC_TARGET=native-native-gnu.2.17" >> "$GITHUB_OUTPUT"
+              echo "SPC_TARGET=x86_64-linux-gnu.2.17" >> "$GITHUB_OUTPUT"
               ;;
             ubuntu-22.04-arm)
               echo "OS=linux" >> "$GITHUB_OUTPUT"
               echo "ARCH=aarch64" >> "$GITHUB_OUTPUT"
-              echo "SPC_TARGET=native-native-gnu.2.17" >> "$GITHUB_OUTPUT"
+              echo "SPC_TARGET=aarch64-linux-gnu.2.17" >> "$GITHUB_OUTPUT"
               ;;
             macos-15-intel)
               echo "OS=macos" >> "$GITHUB_OUTPUT"
