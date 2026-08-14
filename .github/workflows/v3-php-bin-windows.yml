@@ -91,7 +91,22 @@ jobs:
         run: ${{ steps.process-env.outputs.CMD }} install-pkg upx
 
       - name: "Build extensions: ${{ steps.process-env.outputs.EXTENSIONS }}"
-        run: ${{ steps.process-env.outputs.CMD }} build --build-cli --build-micro "${{ steps.process-env.outputs.EXTENSIONS }}" --debug --with-upx-pack --dl-with-php="${{ matrix.php-version }}" --dl-retry=5
+        shell: pwsh
+        run: |
+          # spc exit code 75 = DOWNLOAD_ERROR (network / remote resource error).
+          # Retry up to 3 times on download errors only; build errors (72) fail immediately.
+          $attempt = 0
+          while ($true) {
+            $attempt++
+            Write-Host "Build attempt $attempt/3"
+            & "${{ steps.process-env.outputs.CMD }}" build --build-cli --build-micro "${{ steps.process-env.outputs.EXTENSIONS }}" --debug --with-upx-pack --dl-with-php="${{ matrix.php-version }}" --dl-retry=5
+            $code = $LASTEXITCODE
+            if ($code -eq 0) { exit 0 }
+            Write-Host "::warning::Build attempt $attempt/3 failed with exit code $code"
+            if ($code -ne 75 -or $attempt -ge 3) { exit $code }
+            Write-Host "Download error detected (exit code 75), retrying in 30s..."
+            Start-Sleep -Seconds 30
+          }
 
       - name: "Pack PHP"
         run: |
