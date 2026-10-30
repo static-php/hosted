@@ -28,7 +28,7 @@ on:
     - cron: "0 4 * * 1"
 
 env:
-  GITHUB_TOKEN: ${{ secrets.S_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   SPC_USE_SUDO: "yes"
   OSS_BASE: "https://dl.static-php.dev/v3/deps/llvm-tools"
 

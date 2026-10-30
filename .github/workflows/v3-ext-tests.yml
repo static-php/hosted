@@ -43,7 +43,7 @@ jobs:
         combo: ${{ fromJSON(needs.generate-matrix.outputs.matrix) }}
     env:
       SPC_USE_SUDO: "yes"
-      GITHUB_TOKEN: ${{ secrets.S_GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: "Checkout"
