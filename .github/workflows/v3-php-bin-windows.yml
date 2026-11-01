@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: "0 1 */3 * *"
 
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
 jobs:
   build-release-artifacts:
     name: "Build ${{ matrix.php-version }}-${{ matrix.combination }} on ${{ matrix.runner }}"
@@ -86,8 +89,6 @@ jobs:
         run: ${{ steps.process-env.outputs.CMD }} doctor --auto-fix
 
       - name: "Install UPX"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ${{ steps.process-env.outputs.CMD }} install-pkg upx
 
       - name: "Build extensions: ${{ steps.process-env.outputs.EXTENSIONS }}"
