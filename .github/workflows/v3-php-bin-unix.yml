@@ -132,10 +132,14 @@ jobs:
 
       - name: "Build PHP (extensions: ${{ matrix.combination }})"
         env:
-          EXTENSIONS: ${{ matrix.extensions }}
-          EXTRA: ${{ matrix.extra }}
-          SUGGEST: ${{ matrix.suggest }}
-          PHP_PATCH: ${{ matrix.php-version }}
+          # Keep the SPC_ prefix: make(1) imports every environment variable as a Makefile
+          # variable, and ICU's Makefile uses $(EXTRA) for extra subdirectories. Exporting a
+          # plain EXTRA=--with-upx-pack made "make clean" try to cd into "--with-upx-pack"
+          # and fail the icu build.
+          SPC_EXTENSIONS: ${{ matrix.extensions }}
+          SPC_EXTRA_ARGS: ${{ matrix.extra }}
+          SPC_SUGGEST_ARGS: ${{ matrix.suggest }}
+          SPC_PHP_PATCH: ${{ matrix.php-version }}
         run: |
           # spc exit code 75 = DOWNLOAD_ERROR; retry only on download errors, fail fast on build errors (72).
           # --dl-with-php takes the exact patch planned above (not just the minor line), so the
@@ -143,7 +147,7 @@ jobs:
           set +e
           for attempt in 1 2 3; do
             echo "Build attempt ${attempt}/3"
-            bin/spc build --build-cli --build-micro --build-fpm "$EXTENSIONS" --debug $EXTRA $SUGGEST               --dl-with-php="$PHP_PATCH" --dl-retry=5 --dl-prefer-binary --dl-ignore-cache=php-src
+            bin/spc build --build-cli --build-micro --build-fpm "$SPC_EXTENSIONS" --debug $SPC_EXTRA_ARGS $SPC_SUGGEST_ARGS               --dl-with-php="$SPC_PHP_PATCH" --dl-retry=5 --dl-prefer-binary --dl-ignore-cache=php-src
             code=$?
             if [ "$code" -eq 0 ]; then exit 0; fi
             echo "::warning::Build attempt ${attempt}/3 failed with exit code ${code}"
@@ -154,11 +158,11 @@ jobs:
 
       - name: "Verify built PHP version matches the plan"
         env:
-          PHP_PATCH: ${{ matrix.php-version }}
+          SPC_PHP_PATCH: ${{ matrix.php-version }}
         run: |
           got=$(buildroot/bin/php -r 'echo PHP_VERSION;')
-          if [ "$got" != "$PHP_PATCH" ]; then
-            echo "::error::planned PHP $PHP_PATCH but the built binary reports $got"
+          if [ "$got" != "$SPC_PHP_PATCH" ]; then
+            echo "::error::planned PHP $SPC_PHP_PATCH but the built binary reports $got"
             exit 1
           fi
 
