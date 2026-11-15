@@ -1,56 +1,85 @@
 name: "[v3] Build Self-Hosted PHP Binary (Windows)"
 
+# Same semantics and scripts as the unix workflow (plan/publish run on ubuntu, only build runs on windows):
+#   verify  - every 3 days via cron: full build-only self check, nothing is uploaded
+#   publish - every Sunday via cron or when dispatched: build only the targets that are missing remotely
+# Artifacts: php-<ver>[-N]-<sapi>-win.zip (sapi = cli / micro)
+# Metadata: v3/php-bin/<combo>/version_<MM>.json, versions.json, README.txt
+
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "publish = incremental release / verify = build-only self check (no upload)"
+        type: choice
+        options:
+          - publish
+          - verify
+        default: publish
+      force:
+        description: "In publish mode, force a republish of every target: revision + 1"
+        type: boolean
+        default: false
+      label:
+        description: "Optional note recorded in the metadata of a forced republish"
+        type: string
+        default: ""
   schedule:
-    - cron: "0 1 */3 * *"
+    - cron: "0 2 */3 * *"   # verify: full build-only self check every 3 days
+    - cron: "0 2 * * 0"     # publish: incremental release every Sunday
+
+concurrency:
+  group: v3-php-bin-windows-${{ inputs.mode || 'scheduled' }}
+  cancel-in-progress: false
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  OSS_BASE: "https://dl.static-php.dev/v3/php-bin"
+  PHP_MINORS: "8.2 8.3 8.4 8.5"
+  WORKFLOW_KIND: windows
 
 jobs:
-  build-release-artifacts:
-    name: "Build ${{ matrix.php-version }}-${{ matrix.combination }} on ${{ matrix.runner }}"
+  plan:
+    name: "Plan"
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      state: ${{ steps.plan.outputs.state }}
+      mode: ${{ steps.plan.outputs.mode }}
+      combinations: ${{ steps.plan.outputs.combinations }}
+    steps:
+      - name: "Checkout workflow repository"
+        uses: actions/checkout@v4
+
+      - name: "Resolve mode"
+        id: mode
+        run: |
+          MODE="${{ inputs.mode }}"
+          if [ -z "$MODE" ]; then
+            if [ "${{ github.event.schedule }}" = "0 2 * * 0" ]; then MODE=publish; else MODE=verify; fi
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "::notice::workflow mode: $MODE"
+
+      - name: "Plan targets"
+        id: plan
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+          FORCE: ${{ inputs.force }}
+        run: bash .github/scripts/php-bin-plan.sh
+
+  build:
+    name: "${{ matrix.combination }} ${{ matrix.php-version }} (rev ${{ matrix.revision }})"
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
-        php-version:
-          - "8.2"
-          - "8.3"
-          - "8.4"
-          - "8.5"
-        runner:
-          - "windows-latest"
-        combination:
-          - spc-min
-          - spc-max
-
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-      - name: "Process env string"
-        id: process-env
-        run: |
-          switch ("${{ matrix.combination }}") {
-            "spc-min" {
-                Add-Content -Path $env:GITHUB_OUTPUT -Value "EXTENSIONS=ctype,fileinfo,filter,iconv,mbstring,tokenizer,phar"
-                Add-Content -Path $env:GITHUB_OUTPUT -Value "DEPLOY_TARGET=${{ secrets.DEPLOY_SERVER_TARGET_WINDOWS_SPC_MIN }}"
-            }
-            "spc-max" {
-                Add-Content -Path $env:GITHUB_OUTPUT -Value "EXTENSIONS=amqp,apcu,bcmath,bz2,calendar,ctype,curl,dba,dom,ds,exif,ffi,fileinfo,filter,ftp,gd,iconv,igbinary,libxml,mbregex,mbstring,mysqli,mysqlnd,opcache,openssl,pdo,pdo_mysql,pdo_sqlite,pdo_sqlsrv,phar,rar,redis,session,shmop,simdjson,simplexml,soap,sockets,sqlite3,sqlsrv,ssh2,sysvshm,tokenizer,xml,xmlreader,xmlwriter,yac,yaml,zip,zlib"
-                Add-Content -Path $env:GITHUB_OUTPUT -Value "DEPLOY_TARGET=${{ secrets.DEPLOY_SERVER_TARGET_WINDOWS_SPC_MAX }}"
-            }
-          }
-
-          switch ("${{ matrix.runner }}") {
-              "windows-latest" {
-                  Add-Content -Path $env:GITHUB_OUTPUT -Value "OS=windows"
-                  Add-Content -Path $env:GITHUB_OUTPUT -Value "ARCH=x86_64"
-                  Add-Content -Path $env:GITHUB_OUTPUT -Value "CMD=bin/spc"
-              }
-          }
-
-      - name: "Checkout remote"
-        if: github.repository != 'crazywhalecc/static-php-cli'
+      - name: "Checkout static-php-cli"
         uses: actions/checkout@v4
         with:
           repository: crazywhalecc/static-php-cli
@@ -65,7 +94,6 @@ jobs:
           ini-values: memory_limit=-1
 
       - name: "Cache composer packages"
-        id: composer-cache
         uses: actions/cache@v4
         with:
           path: vendor
@@ -73,88 +101,140 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-php
 
-      - id: cache-download
+      - name: "Cache downloaded artifacts"
         uses: actions/cache@v4
         with:
           path: downloads
-          key: pack-lib-dependencies-${{ matrix.combination }}-${{ matrix.php-version }}-${{ matrix.runner }}
+          key: v3-php-bin-${{ matrix.combination }}-${{ matrix.php-version }}-${{ matrix.runner }}
 
       - name: "Install Dependencies"
         run: composer update -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist --no-dev
 
-      - name: "Validate SPC powershell script"
-        run: ${{ steps.process-env.outputs.CMD }} --version
+      - name: "Validate SPC entrypoint"
+        run: bin/spc --version
 
       - name: "Run Build Tests (doctor)"
-        run: ${{ steps.process-env.outputs.CMD }} doctor --auto-fix
+        run: bin/spc doctor --auto-fix
 
       - name: "Install UPX"
-        run: ${{ steps.process-env.outputs.CMD }} install-pkg upx
+        run: bin/spc install-pkg upx
 
-      - name: "Build extensions: ${{ steps.process-env.outputs.EXTENSIONS }}"
+      - name: "Build PHP (extensions: ${{ matrix.combination }})"
         shell: pwsh
+        env:
+          EXTENSIONS: ${{ matrix.extensions }}
+          EXTRA: ${{ matrix.extra }}
+          PHP_MINOR: ${{ matrix.php-minor }}
         run: |
-          # spc exit code 75 = DOWNLOAD_ERROR (network / remote resource error).
-          # Retry up to 3 times on download errors only; build errors (72) fail immediately.
+          # spc exit code 75 = DOWNLOAD_ERROR; retry only on download errors.
           $attempt = 0
           while ($true) {
             $attempt++
             Write-Host "Build attempt $attempt/3"
-            & "${{ steps.process-env.outputs.CMD }}" build --build-cli --build-micro "${{ steps.process-env.outputs.EXTENSIONS }}" --debug --with-upx-pack --dl-with-php="${{ matrix.php-version }}" --dl-retry=5
+            & bin/spc build --build-cli --build-micro "$env:EXTENSIONS" --debug $env:EXTRA --dl-with-php="$env:PHP_MINOR" --dl-retry=5
             $code = $LASTEXITCODE
             if ($code -eq 0) { exit 0 }
             Write-Host "::warning::Build attempt $attempt/3 failed with exit code $code"
             if ($code -ne 75 -or $attempt -ge 3) { exit $code }
-            Write-Host "Download error detected (exit code 75), retrying in 30s..."
             Start-Sleep -Seconds 30
           }
 
-      - name: "Pack PHP"
-        run: |
-          $PHPINFO = ${{ steps.process-env.outputs.CMD }} dev:info php --json --no-ansi | ConvertFrom-Json
-          $PHPVER = $PHPINFO.cache.source.info.version
-          if (-not $PHPVER) {
-            throw "Cannot resolve PHP version from dev:info php --json"
-          }
-
-          New-Item -ItemType Directory -Force -Path dist
-          Compress-Archive -Path "buildroot\bin\php.exe" -DestinationPath "dist\php-$PHPVER-cli-win.zip"
-          Compress-Archive -Path "buildroot\bin\micro.sfx" -DestinationPath "dist\php-$PHPVER-micro-win.zip"
-          ls dist
-          echo ("PHPVER=" + $PHPVER) >> $env:GITHUB_ENV
-
-      - name: "Generate SHA-256 checksums"
+      - name: "Smoke test built binaries"
         shell: pwsh
         run: |
-          # Every matrix job uploads into the same OSS prefix, so one shared checksum file would be
-          # overwritten by whichever job finishes last. Publish a `<archive>.sha256` sidecar next to
-          # each archive instead, in the `<hash>  <name>` format `sha256sum -c` understands.
-          $archives = @(Get-ChildItem -Path dist -Filter *.zip)
-          if ($archives.Count -eq 0) { throw "No archives found in dist" }
+          & buildroot\bin\php.exe -v
+          & buildroot\bin\php.exe -m | Select-Object -First 5
 
-          foreach ($archive in $archives) {
+      - name: "Pack archives"
+        shell: pwsh
+        env:
+          PHPVER: ${{ matrix.php-version }}
+          REV: ${{ matrix.revision }}
+          SFX: ${{ matrix.archive-suffix }}
+        run: |
+          $PHPVER = $env:PHPVER
+          $REV = [int]$env:REV
+          $SFX = $env:SFX
+          $base = "php-$PHPVER"
+          if ($REV -gt 0) { $base = "$base-$REV" }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "buildroot\bin\php.exe" -DestinationPath "dist\$base-cli-$SFX.zip" -Force
+          Compress-Archive -Path "buildroot\bin\micro.sfx" -DestinationPath "dist\$base-micro-$SFX.zip" -Force
+          Get-ChildItem dist | ForEach-Object { Write-Host $_.Name }
+
+      - name: "Generate SHA-256 sidecars"
+        shell: pwsh
+        run: |
+          foreach ($archive in @(Get-ChildItem -Path dist -Filter *.zip)) {
             $hash = (Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash.ToLower()
-            # ASCII plus LF endings, so the sidecar also verifies on Linux and macOS.
             [System.IO.File]::WriteAllText(
               "$($archive.FullName).sha256",
-              "$hash  $($archive.Name)`n",
+              $hash + "  " + $archive.Name + [char]10,
               [System.Text.Encoding]::ASCII
             )
             Get-Content -LiteralPath "$($archive.FullName).sha256"
           }
 
-          # Sanity-check that every sidecar parses and matches the archive it was written for.
-          foreach ($checksum in Get-ChildItem -Path dist -Filter *.sha256) {
-            $expected, $name = (Get-Content -LiteralPath $checksum.FullName -Raw).Trim() -split '\s+', 2
-            $actual = (Get-FileHash -LiteralPath (Join-Path dist $name) -Algorithm SHA256).Hash.ToLower()
-            if ($actual -ne $expected) { throw "Checksum verification failed for $name" }
-          }
-
-      - name: "Add README for ${{ matrix.combination }}"
-        if: ${{ matrix.php-version == '8.4' }}
-        shell: bash
+      - name: "Write build info"
+        shell: pwsh
+        env:
+          PHPVER: ${{ matrix.php-version }}
+          SFX: ${{ matrix.archive-suffix }}
         run: |
-          echo -e "# Note\n\nCurrent distribution uses extensions:\n\n${{ steps.process-env.outputs.EXTENSIONS }}\n\nUsing compile command:\n\n  bin/spc build --build-cli --build-micro \"${{ steps.process-env.outputs.EXTENSIONS }}\" --debug --with-upx-pack --dl-with-php=\"${{ matrix.php-version }}\"" > dist/README.txt
+          $spcVersion = (& bin/spc --version --no-ansi 2>$null | Select-Object -Last 1).Trim()
+          $spcRef = (git rev-parse --short HEAD).Trim()
+          $info = @{
+            "spc-version" = $spcVersion
+            "spc-ref" = "v3@$spcRef"
+            "built-at" = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          }
+          $info | ConvertTo-Json -Compress | Set-Content -Path "dist\info-$env:PHPVER-$env:SFX.json" -Encoding ASCII
+
+      - name: "Upload artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: php-bin-${{ matrix.combination }}-${{ matrix.php-version }}-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: "Upload logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spc-logs-${{ matrix.combination }}-${{ matrix.php-version }}
+          path: log/*.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+  publish:
+    name: "Publish ${{ matrix.combination }}"
+    needs: [plan, build]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.mode == 'publish'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        combination: ${{ fromJSON(needs.plan.outputs.combinations) }}
+    steps:
+      - name: "Checkout workflow repository"
+        uses: actions/checkout@v4
+
+      - name: "Download this combination's artifacts"
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: php-bin-${{ matrix.combination }}-*
+          path: stage
+          merge-multiple: true
+
+      - name: "Publish (verify, hash, metadata, upload)"
+        env:
+          COMBO: ${{ matrix.combination }}
+          STATE: ${{ needs.plan.outputs.state }}
+          LABEL: ${{ inputs.label }}
+        run: bash .github/scripts/php-bin-publish.sh
 
       - name: "Deploy to self-hosted OSS"
         uses: static-php/upload-s3-action@v1.0.0
@@ -165,12 +245,3 @@ jobs:
           source_dir: "dist/"
           destination_dir: v3/php-bin/${{ matrix.combination }}/
           endpoint: ${{ secrets.AWS_ENDPOINT }}
-
-      - name: "Upload Artifact"
-        uses: actions/upload-artifact@v4
-        with:
-          name: php-${{ matrix.php-version }}-windows-${{ matrix.combination }}
-          path: |
-            buildroot/bin/php.exe
-            buildroot/bin/micro.sfx
-          if-no-files-found: error
