@@ -1,116 +1,98 @@
 name: "[v3] Build Self-Hosted PHP Binary (Unix)"
 
+# Modes (resolved by the plan job):
+#   verify  - every 3 days via cron: full rebuild, only to prove that the spc on the v3 branch still builds; nothing is uploaded
+#   publish - every Sunday via cron, or manually: build only the (PHP version, platform) targets that are missing remotely, then publish incrementally
+#
+# Published artifacts are never overwritten:
+#   rev 0 = php-<ver>-<sapi>-<suffix>.<ext>        (first publication, bare file name)
+#   rev N = php-<ver>-N-<sapi>-<suffix>.<ext>      (forced republish, N increases monotonically)
+# Metadata is written by the single writer in the publish job, so there is no read-modify-write race:
+#   v3/php-bin/<combo>/versions.json
+#   v3/php-bin/<combo>/version_<MM>.json
+#   v3/php-bin/<combo>/README.txt
+
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "publish = incremental release / verify = build-only self check (no upload)"
+        type: choice
+        options:
+          - publish
+          - verify
+        default: publish
+      force:
+        description: "In publish mode, force a republish of every target: revision + 1"
+        type: boolean
+        default: false
+      label:
+        description: "Optional note recorded in the metadata of a forced republish (e.g. openssl-cve-2026-1234)"
+        type: string
+        default: ""
   schedule:
-    - cron: "0 1 */3 * *"
+    - cron: "0 1 */3 * *"   # verify: full build-only self check every 3 days
+    - cron: "0 1 * * 0"     # publish: incremental release every Sunday (only does work when a new PHP patch appears)
+
+concurrency:
+  # Every run that can publish must share one group: a scheduled publish and a manual publish
+  # would otherwise plan against the same remote state and allocate the same revision.
+  # verify keeps its own group, so a long self-check never blocks a release.
+  group: "v3-php-bin-unix-${{ (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 0') && 'publish' || inputs.mode || 'verify' }}"
+  cancel-in-progress: false
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  OSS_BASE: "https://dl.static-php.dev/v3/php-bin"
+  PHP_MINORS: "8.2 8.3 8.4 8.5"
+  WORKFLOW_KIND: unix
 
 jobs:
-  build-release-artifacts:
-    name: "Build ${{ matrix.php-version }}-${{ matrix.combination }} on ${{ matrix.runner }}"
+  plan:
+    name: "Plan"
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      state: ${{ steps.plan.outputs.state }}
+      mode: ${{ steps.plan.outputs.mode }}
+      combinations: ${{ steps.plan.outputs.combinations }}
+    steps:
+      - name: "Checkout workflow repository"
+        uses: actions/checkout@v4
+
+      - name: "Resolve mode"
+        id: mode
+        run: |
+          MODE="${{ inputs.mode }}"
+          if [ -z "$MODE" ]; then
+            if [ "${{ github.event.schedule }}" = "0 1 * * 0" ]; then MODE=publish; else MODE=verify; fi
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "::notice::workflow mode: $MODE"
+
+      - name: "Plan targets"
+        id: plan
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+          FORCE: ${{ inputs.force }}
+        run: bash .github/scripts/php-bin-plan.sh
+
+  build:
+    name: "${{ matrix.combination }} ${{ matrix.php-version }} ${{ matrix.platform }} (rev ${{ matrix.revision }})"
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
-        php-version:
-          - "8.2"
-          - "8.3"
-          - "8.4"
-          - "8.5"
-        runner:
-          - "ubuntu-latest"
-          - "macos-15-intel"
-          - "ubuntu-24.04-arm"
-          - "macos-15"
-          - "ubuntu-22.04"
-          - "ubuntu-22.04-arm"
-        combination:
-          - minimal
-          - bulk
-          - common
-          - gnu-bulk
-        exclude:
-          - { runner: "ubuntu-latest", combination: "gnu-bulk" }
-          - { runner: "ubuntu-24.04-arm", combination: "gnu-bulk" }
-          - { runner: "macos-15-intel", combination: "gnu-bulk" }
-          - { runner: "macos-15", combination: "gnu-bulk" }
-          - { runner: "ubuntu-22.04", combination: "minimal" }
-          - { runner: "ubuntu-22.04", combination: "bulk" }
-          - { runner: "ubuntu-22.04", combination: "common" }
-          - { runner: "ubuntu-22.04-arm", combination: "minimal" }
-          - { runner: "ubuntu-22.04-arm", combination: "bulk" }
-          - { runner: "ubuntu-22.04-arm", combination: "common" }
-
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-      - name: "Process env string"
-        id: process-env
-        shell: bash
-        run: |
-          case "${{ matrix.combination }}" in
-            minimal)
-              echo "EXTENSIONS=iconv,pcntl,posix,mbstring,filter,tokenizer,phar" >> "$GITHUB_OUTPUT"
-              ;;
-            common)
-              echo "EXTENSIONS=bcmath,bz2,calendar,ctype,curl,dom,exif,fileinfo,filter,ftp,gd,gmp,iconv,xml,mbstring,mbregex,mysqlnd,openssl,pcntl,pdo,pdo_mysql,pdo_sqlite,pdo_pgsql,pgsql,phar,posix,redis,session,simplexml,soap,sockets,sqlite3,tokenizer,xmlwriter,xmlreader,zlib,zip" >> "$GITHUB_OUTPUT"
-              echo "SUGGEST=--with-suggests" >> "$GITHUB_OUTPUT"
-              ;;
-            bulk|gnu-bulk)
-              echo "EXTENSIONS=apcu,bcmath,bz2,calendar,ctype,curl,dba,dom,event,exif,fileinfo,filter,ftp,gd,gmp,iconv,imagick,imap,intl,mbregex,mbstring,mysqli,mysqlnd,opcache,openssl,opentelemetry,pcntl,pdo,pdo_mysql,pgsql,phar,posix,protobuf,readline,redis,session,shmop,simplexml,soap,sockets,sodium,sqlite3,swoole,swoole-hook-mysql,swoole-hook-pgsql,swoole-hook-sqlite,sysvmsg,sysvsem,sysvshm,tokenizer,xml,xmlreader,xmlwriter,xsl,zip,zlib" >> "$GITHUB_OUTPUT"
-              echo "SUGGEST=--with-suggests" >> "$GITHUB_OUTPUT"
-              ;;
-          esac
-
-          echo "CMD=bin/spc" >> "$GITHUB_OUTPUT"
-
-          case "${{ matrix.runner }}" in
-            ubuntu-latest)
-              echo "OS=linux" >> "$GITHUB_OUTPUT"
-              echo "ARCH=x86_64" >> "$GITHUB_OUTPUT"
-              echo "UPX=--with-upx-pack" >> "$GITHUB_OUTPUT"
-              ;;
-            ubuntu-24.04-arm)
-              echo "OS=linux" >> "$GITHUB_OUTPUT"
-              echo "ARCH=aarch64" >> "$GITHUB_OUTPUT"
-              echo "UPX=--with-upx-pack" >> "$GITHUB_OUTPUT"
-              ;;
-            ubuntu-22.04)
-              echo "OS=linux" >> "$GITHUB_OUTPUT"
-              echo "ARCH=x86_64" >> "$GITHUB_OUTPUT"
-              echo "SPC_TARGET=x86_64-linux-gnu.2.17" >> "$GITHUB_OUTPUT"
-              ;;
-            ubuntu-22.04-arm)
-              echo "OS=linux" >> "$GITHUB_OUTPUT"
-              echo "ARCH=aarch64" >> "$GITHUB_OUTPUT"
-              echo "SPC_TARGET=aarch64-linux-gnu.2.17" >> "$GITHUB_OUTPUT"
-              ;;
-            macos-15-intel)
-              echo "OS=macos" >> "$GITHUB_OUTPUT"
-              echo "ARCH=x86_64" >> "$GITHUB_OUTPUT"
-              ;;
-            macos-15)
-              echo "OS=macos" >> "$GITHUB_OUTPUT"
-              echo "ARCH=aarch64" >> "$GITHUB_OUTPUT"
-              ;;
-          esac
-
-      - name: "Checkout current repository"
-        if: github.repository == 'crazywhalecc/static-php-cli'
-        uses: actions/checkout@v4
-
-      - name: "Checkout remote"
-        if: github.repository != 'crazywhalecc/static-php-cli'
+      - name: "Checkout static-php-cli"
         uses: actions/checkout@v4
         with:
           repository: crazywhalecc/static-php-cli
           ref: v3
-
-      - name: "Apply target env"
-        if: ${{ steps.process-env.outputs.SPC_TARGET != '' }}
-        shell: bash
-        run: echo "SPC_TARGET=${{ steps.process-env.outputs.SPC_TARGET }}" >> "$GITHUB_ENV"
 
       - name: "Setup PHP"
         uses: shivammathur/setup-php@v2
@@ -137,106 +119,150 @@ jobs:
       - name: "Install Dependencies"
         run: composer update -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist --no-dev
 
+      - name: "Apply target triple"
+        if: matrix.spc-target != ''
+        run: echo "SPC_TARGET=${{ matrix.spc-target }}" >> "$GITHUB_ENV"
+
       - name: "Run Build Tests (doctor)"
-        run: ${{ steps.process-env.outputs.CMD }} doctor --auto-fix
+        run: bin/spc doctor --auto-fix
 
       - name: "Install UPX"
-        if: ${{ steps.process-env.outputs.UPX != '' }}
-        run: ${{ steps.process-env.outputs.CMD }} install-pkg upx
+        if: contains(matrix.extra, 'with-upx-pack')
+        run: bin/spc install-pkg upx
 
-      - name: "Build PHP"
-        shell: bash
+      - name: "Build PHP (extensions: ${{ matrix.combination }})"
+        env:
+          EXTENSIONS: ${{ matrix.extensions }}
+          EXTRA: ${{ matrix.extra }}
+          SUGGEST: ${{ matrix.suggest }}
+          PHP_PATCH: ${{ matrix.php-version }}
         run: |
-          # spc exit code 75 = DOWNLOAD_ERROR (network / remote resource error).
-          # Retry up to 3 times on download errors only; build errors (72) fail immediately.
-          # Note: `if` is used so that a non-zero exit does not trip the default `set -e`.
+          # spc exit code 75 = DOWNLOAD_ERROR; retry only on download errors, fail fast on build errors (72).
+          # --dl-with-php takes the exact patch planned above (not just the minor line), so the
+          # artifact name cannot drift when php.net publishes a new patch between plan and build.
+          set +e
           for attempt in 1 2 3; do
             echo "Build attempt ${attempt}/3"
-            if ${{ steps.process-env.outputs.CMD }} build \
-              --build-cli \
-              --build-micro \
-              --build-fpm \
-              "${{ steps.process-env.outputs.EXTENSIONS }}" \
-              --debug \
-              ${{ steps.process-env.outputs.UPX }} \
-              ${{ steps.process-env.outputs.SUGGEST }} \
-              --dl-with-php="${{ matrix.php-version }}" \
-              --dl-retry=5 \
-              --dl-prefer-binary \
-              --dl-ignore-cache=php-src; then
-              exit 0
-            else
-              code=$?
-            fi
+            bin/spc build --build-cli --build-micro --build-fpm "$EXTENSIONS" --debug $EXTRA $SUGGEST               --dl-with-php="$PHP_PATCH" --dl-retry=5 --dl-prefer-binary --dl-ignore-cache=php-src
+            code=$?
+            if [ "$code" -eq 0 ]; then exit 0; fi
             echo "::warning::Build attempt ${attempt}/3 failed with exit code ${code}"
-            if [ "$code" -ne 75 ]; then
-              # Not a download error, do not retry
-              exit "$code"
-            fi
-            if [ "$attempt" -lt 3 ]; then
-              echo "Download error detected (exit code 75), retrying in 30s..."
-              sleep 30
-            fi
+            if [ "$code" -ne 75 ]; then exit "$code"; fi
+            sleep 30
           done
           exit 75
 
-      - name: "Pack PHP"
-        shell: bash
+      - name: "Verify built PHP version matches the plan"
+        env:
+          PHP_PATCH: ${{ matrix.php-version }}
         run: |
-          mkdir -p tmp_dist dist
-
-          cp buildroot/bin/php tmp_dist/
-          cp buildroot/bin/micro.sfx tmp_dist/
-          cp buildroot/bin/php-fpm tmp_dist/
-
-          ${{ steps.process-env.outputs.CMD }} dev:info php --json --no-ansi > php-info.json
-          PHPVER="$(php -r '$j = json_decode(file_get_contents("php-info.json"), true); echo $j["cache"]["source"]["info"]["version"] ?? "";')"
-          if [ -z "$PHPVER" ]; then
-            echo "Cannot resolve PHP version from dev:info php --json"
+          got=$(buildroot/bin/php -r 'echo PHP_VERSION;')
+          if [ "$got" != "$PHP_PATCH" ]; then
+            echo "::error::planned PHP $PHP_PATCH but the built binary reports $got"
             exit 1
           fi
 
-          chmod -R 755 tmp_dist
-          sudo chmod -R 777 dist || true
+      - name: "Smoke test built binaries"
+        run: |
+          buildroot/bin/php -v
+          buildroot/bin/php -m | head -n 5
+          buildroot/bin/php-fpm -v
 
-          tar -czf "dist/php-$PHPVER-cli-${{ steps.process-env.outputs.OS }}-${{ steps.process-env.outputs.ARCH }}.tar.gz" -C tmp_dist/ php
-          tar -czf "dist/php-$PHPVER-micro-${{ steps.process-env.outputs.OS }}-${{ steps.process-env.outputs.ARCH }}.tar.gz" -C tmp_dist/ micro.sfx
-          tar -czf "dist/php-$PHPVER-fpm-${{ steps.process-env.outputs.OS }}-${{ steps.process-env.outputs.ARCH }}.tar.gz" -C tmp_dist/ php-fpm
-
-          echo "PHPVER=$PHPVER" >> "$GITHUB_ENV"
+      - name: "Pack archives"
+        env:
+          PHPVER: ${{ matrix.php-version }}
+          REV: ${{ matrix.revision }}
+          SFX: ${{ matrix.archive-suffix }}
+        run: |
+          set -euo pipefail
+          mkdir -p tmp_dist dist
+          cp buildroot/bin/php tmp_dist/
+          cp buildroot/bin/micro.sfx tmp_dist/
+          cp buildroot/bin/php-fpm tmp_dist/
+          base="php-$PHPVER"
+          if [ "$REV" -gt 0 ]; then base="$base-$REV"; fi
+          for sapi in cli micro fpm; do
+            case "$sapi" in
+              cli) member=php ;;
+              micro) member=micro.sfx ;;
+              fpm) member=php-fpm ;;
+            esac
+            tar -czf "dist/$base-$sapi-$SFX.tar.gz" -C tmp_dist "$member"
+          done
           ls -la dist
 
-      - name: "Generate SHA-256 checksums"
-        shell: bash
+      - name: "Bundle licenses and build manifest"
+        if: matrix.php-minor == '8.4' && matrix.platform == 'linux-x86_64'
         run: |
-          # Every matrix job uploads into the same OSS prefix, so one shared checksum file would be
-          # overwritten by whichever job finishes last. Publish a `<archive>.sha256` sidecar next to
-          # each archive instead, in the `<hash>  <name>` format `sha256sum -c` understands.
-          cd dist
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
-            verify_sha256() { sha256sum -c --strict "$@"; }
-          else
-            sha256_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
-            verify_sha256() { shasum -a 256 -c "$@"; }
-          fi
-
-          for archive in *.tar.gz; do
-            [ -e "$archive" ] || continue
-            printf '%s  %s\n' "$(sha256_of "$archive")" "$archive" > "$archive.sha256"
-            cat "$archive.sha256"
-          done
-
-          # Sanity-check that every sidecar parses and matches the archive it was written for.
-          verify_sha256 ./*.sha256
-
-      - name: "Add build metadata"
-        if: ${{ matrix.php-version == '8.4' && (matrix.runner == 'ubuntu-latest' || matrix.runner == 'ubuntu-22.04') }}
-        shell: bash
-        run: |
+          set -euo pipefail
           cp -r buildroot/license dist/
           cp buildroot/build-manifest.json dist/
-          echo -e "# Note\n\nCurrent distribution uses extensions:\n\n${{ steps.process-env.outputs.EXTENSIONS }}\n\nUsing compile command:\n\n  ${{ steps.process-env.outputs.CMD }} build --build-cli --build-micro --build-fpm \"${{ steps.process-env.outputs.EXTENSIONS }}\" --debug ${{ steps.process-env.outputs.UPX }} ${{ steps.process-env.outputs.SUGGEST }} --dl-with-php=\"${{ matrix.php-version }}\" --dl-retry=5 --dl-prefer-binary --dl-ignore-cache=php-src\n\nSPC_TARGET:\n\n  ${SPC_TARGET:-default}" > dist/README.txt
+
+      - name: "Generate SHA-256 sidecars"
+        run: |
+          set -euo pipefail
+          cd dist
+          for archive in *.tar.gz; do
+            printf '%s  %s\n' "$(sha256sum "$archive" | cut -d' ' -f1)" "$archive" > "$archive.sha256"
+          done
+          sha256sum -c --strict ./*.sha256
+
+      - name: "Write build info"
+        env:
+          PHPVER: ${{ matrix.php-version }}
+          SFX: ${{ matrix.archive-suffix }}
+        run: |
+          set -euo pipefail
+          SPC_VERSION=$(bin/spc --version --no-ansi 2>/dev/null | tail -n1 | tr -d '\r')
+          SPC_REF=$(git rev-parse --short HEAD)
+          printf '{"spc-version":"%s","spc-ref":"v3@%s","built-at":"%s"}\n' \
+            "$SPC_VERSION" "$SPC_REF" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "dist/info-$PHPVER-$SFX.json"
+
+      - name: "Upload artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: php-bin-${{ matrix.combination }}-${{ matrix.php-version }}-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: "Upload logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spc-logs-${{ matrix.combination }}-${{ matrix.php-version }}-${{ matrix.platform }}
+          path: log/*.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+  publish:
+    name: "Publish ${{ matrix.combination }}"
+    needs: [plan, build]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.mode == 'publish'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        combination: ${{ fromJSON(needs.plan.outputs.combinations) }}
+    steps:
+      - name: "Checkout workflow repository"
+        uses: actions/checkout@v4
+
+      - name: "Download this combination's artifacts"
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: php-bin-${{ matrix.combination }}-*
+          path: stage
+          merge-multiple: true
+
+      - name: "Publish (verify, hash, metadata, upload)"
+        env:
+          COMBO: ${{ matrix.combination }}
+          STATE: ${{ needs.plan.outputs.state }}
+          LABEL: ${{ inputs.label }}
+        run: bash .github/scripts/php-bin-publish.sh
 
       - name: "Deploy to self-hosted OSS"
         uses: static-php/upload-s3-action@v1.0.0
@@ -247,21 +273,3 @@ jobs:
           source_dir: "dist/"
           destination_dir: v3/php-bin/${{ matrix.combination }}/
           endpoint: ${{ secrets.AWS_ENDPOINT }}
-
-      - name: "Upload Artifact"
-        uses: actions/upload-artifact@v4
-        with:
-          name: php-${{ env.PHPVER }}-${{ matrix.combination }}-${{ steps.process-env.outputs.OS }}-${{ steps.process-env.outputs.ARCH }}
-          path: |
-            tmp_dist/php
-            tmp_dist/php-fpm
-            tmp_dist/micro.sfx
-          if-no-files-found: error
-
-      - name: "Upload logs on failure"
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: spc-logs-${{ matrix.php-version }}-${{ matrix.combination }}-${{ matrix.runner }}
-          path: log/*.log
-          if-no-files-found: ignore
