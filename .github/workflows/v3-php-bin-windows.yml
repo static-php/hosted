@@ -125,9 +125,11 @@ jobs:
       - name: "Build PHP (extensions: ${{ matrix.combination }})"
         shell: pwsh
         env:
-          EXTENSIONS: ${{ matrix.extensions }}
-          EXTRA: ${{ matrix.extra }}
-          PHP_PATCH: ${{ matrix.php-version }}
+          # SPC_ prefix: nmake/pwsh child processes inherit these names, so avoid plain
+          # EXTRA/EXTENSIONS which may collide with a build system's own variables.
+          SPC_EXTENSIONS: ${{ matrix.extensions }}
+          SPC_EXTRA_ARGS: ${{ matrix.extra }}
+          SPC_PHP_PATCH: ${{ matrix.php-version }}
         run: |
           # spc exit code 75 = DOWNLOAD_ERROR; retry only on download errors.
           # --dl-with-php takes the exact patch planned above, so the artifact name cannot
@@ -136,7 +138,7 @@ jobs:
           while ($true) {
             $attempt++
             Write-Host "Build attempt $attempt/3"
-            & bin/spc build --build-cli --build-micro "$env:EXTENSIONS" --debug $env:EXTRA --dl-with-php="$env:PHP_PATCH" --dl-retry=5
+            & bin/spc build --build-cli --build-micro "$env:SPC_EXTENSIONS" --debug $env:SPC_EXTRA_ARGS --dl-with-php="$env:SPC_PHP_PATCH" --dl-retry=5
             $code = $LASTEXITCODE
             if ($code -eq 0) { exit 0 }
             Write-Host "::warning::Build attempt $attempt/3 failed with exit code $code"
@@ -147,11 +149,11 @@ jobs:
       - name: "Verify built PHP version matches the plan"
         shell: pwsh
         env:
-          PHP_PATCH: ${{ matrix.php-version }}
+          SPC_PHP_PATCH: ${{ matrix.php-version }}
         run: |
           $got = (& buildroot\bin\php.exe -r 'echo PHP_VERSION;').Trim()
-          if ($got -ne $env:PHP_PATCH) {
-            Write-Host "::error::planned PHP $env:PHP_PATCH but the built binary reports $got"
+          if ($got -ne $env:SPC_PHP_PATCH) {
+            Write-Host "::error::planned PHP $env:SPC_PHP_PATCH but the built binary reports $got"
             exit 1
           }
 
