@@ -35,7 +35,10 @@ on:
     - cron: "0 1 * * 0"     # publish: incremental release every Sunday (only does work when a new PHP patch appears)
 
 concurrency:
-  group: v3-php-bin-unix-${{ inputs.mode || 'scheduled' }}
+  # Every run that can publish must share one group: a scheduled publish and a manual publish
+  # would otherwise plan against the same remote state and allocate the same revision.
+  # verify keeps its own group, so a long self-check never blocks a release.
+  group: "v3-php-bin-unix-${{ (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 0') && 'publish' || inputs.mode || 'verify' }}"
   cancel-in-progress: false
 
 env:
@@ -116,6 +119,10 @@ jobs:
       - name: "Install Dependencies"
         run: composer update -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist --no-dev
 
+      - name: "Apply target triple"
+        if: matrix.spc-target != ''
+        run: echo "SPC_TARGET=${{ matrix.spc-target }}" >> "$GITHUB_ENV"
+
       - name: "Run Build Tests (doctor)"
         run: bin/spc doctor --auto-fix
 
@@ -128,13 +135,15 @@ jobs:
           EXTENSIONS: ${{ matrix.extensions }}
           EXTRA: ${{ matrix.extra }}
           SUGGEST: ${{ matrix.suggest }}
-          PHP_MINOR: ${{ matrix.php-minor }}
+          PHP_PATCH: ${{ matrix.php-version }}
         run: |
           # spc exit code 75 = DOWNLOAD_ERROR; retry only on download errors, fail fast on build errors (72).
+          # --dl-with-php takes the exact patch planned above (not just the minor line), so the
+          # artifact name cannot drift when php.net publishes a new patch between plan and build.
           set +e
           for attempt in 1 2 3; do
             echo "Build attempt ${attempt}/3"
-            bin/spc build --build-cli --build-micro --build-fpm "$EXTENSIONS" --debug $EXTRA $SUGGEST               --dl-with-php="$PHP_MINOR" --dl-retry=5 --dl-prefer-binary --dl-ignore-cache=php-src
+            bin/spc build --build-cli --build-micro --build-fpm "$EXTENSIONS" --debug $EXTRA $SUGGEST               --dl-with-php="$PHP_PATCH" --dl-retry=5 --dl-prefer-binary --dl-ignore-cache=php-src
             code=$?
             if [ "$code" -eq 0 ]; then exit 0; fi
             echo "::warning::Build attempt ${attempt}/3 failed with exit code ${code}"
@@ -142,6 +151,16 @@ jobs:
             sleep 30
           done
           exit 75
+
+      - name: "Verify built PHP version matches the plan"
+        env:
+          PHP_PATCH: ${{ matrix.php-version }}
+        run: |
+          got=$(buildroot/bin/php -r 'echo PHP_VERSION;')
+          if [ "$got" != "$PHP_PATCH" ]; then
+            echo "::error::planned PHP $PHP_PATCH but the built binary reports $got"
+            exit 1
+          fi
 
       - name: "Smoke test built binaries"
         run: |
@@ -171,6 +190,13 @@ jobs:
             tar -czf "dist/$base-$sapi-$SFX.tar.gz" -C tmp_dist "$member"
           done
           ls -la dist
+
+      - name: "Bundle licenses and build manifest"
+        if: matrix.php-minor == '8.4' && matrix.platform == 'linux-x86_64'
+        run: |
+          set -euo pipefail
+          cp -r buildroot/license dist/
+          cp buildroot/build-manifest.json dist/
 
       - name: "Generate SHA-256 sidecars"
         run: |

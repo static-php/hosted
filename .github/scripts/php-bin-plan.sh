@@ -158,6 +158,27 @@ any_object() { # combo ver rev suffix
   return 1
 }
 
+# A target counts as published when ANY complete revision exists: rev 0, or a recovery revision
+# N>=1 that completed after a partial rev 0. Without this, a partial rev 0 would schedule a new
+# recovery revision on every single run (rev 0 is never repaired, because nothing is overwritten).
+# Probing stops at the first fully absent revision; gaps are not expected.
+find_complete_rev() { # combo ver suffix
+  local combo=$1 ver=$2 sfx=$3 n=1
+  if set_complete "$combo" "$ver" 0 "$sfx"; then
+    printf '0'
+    return 0
+  fi
+  while [ "$n" -le 50 ]; do
+    if set_complete "$combo" "$ver" "$n" "$sfx"; then
+      printf '%s' "$n"
+      return 0
+    fi
+    any_object "$combo" "$ver" "$n" "$sfx" || return 0
+    n=$((n + 1))
+  done
+  return 0
+}
+
 next_free_rev() { # combo ver suffix
   local combo=$1 ver=$2 sfx=$3 n=1
   while [ "$n" -le 50 ]; do
@@ -217,7 +238,7 @@ trap 'rm -f "$matrix" "$state" "$all" "$ERRLOG"' EXIT
 : >"$all"
 
 export OSS_BASE WORKFLOW_KIND MODE FORCE VERSIONS ERRLOG
-export -f extensions_for suggest_for sapis_for archive_ext http_code status file_name url_of set_complete any_object next_free_rev
+export -f extensions_for suggest_for sapis_for archive_ext http_code status file_name url_of set_complete any_object find_complete_rev next_free_rev
 
 plan_one() {
   local row=$1 combo platform runner os arch sfx spctarget extra minor ver action revision ext sapis
@@ -229,15 +250,21 @@ plan_one() {
 
   if [ "$MODE" = verify ]; then
     action=build
-  elif set_complete "$combo" "$ver" 0 "$sfx"; then
-    if [ "$FORCE" = true ]; then
-      action=publish
-      revision=$(next_free_rev "$combo" "$ver" "$sfx")
-    fi
   else
-    action=publish
-    if any_object "$combo" "$ver" 0 "$sfx"; then
-      revision=$(next_free_rev "$combo" "$ver" "$sfx")
+    complete=$(find_complete_rev "$combo" "$ver" "$sfx")
+    if [ -n "$complete" ]; then
+      # Already published (possibly as a recovery revision). Only a forced run touches it again.
+      if [ "$FORCE" = true ]; then
+        action=publish
+        revision=$(next_free_rev "$combo" "$ver" "$sfx")
+      else
+        revision=$complete
+      fi
+    else
+      action=publish
+      if any_object "$combo" "$ver" 0 "$sfx"; then
+        revision=$(next_free_rev "$combo" "$ver" "$sfx")
+      fi
     fi
   fi
 

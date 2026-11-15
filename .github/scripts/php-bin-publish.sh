@@ -90,9 +90,23 @@ remote_sha256() { # ver rev sfx sapi -> hash, or empty when absent
 
 mkdir -p "$DEST"
 
+# Filled in once a version_<MM>.json is written; referenced by the README block below.
+build_command=""
+
 # 1) This run artifacts go into DEST; only archives and .sha256 files are published, info-*.json stays in STAGE
 if [ -d "$STAGE" ]; then
   find "$STAGE" -maxdepth 1 -type f \( -name "*.$EXT" -o -name "*.$EXT.sha256" \) -exec cp {} "$DEST/" \;
+fi
+
+# Bundled licenses and the build manifest are rolling docs (not immutable artifacts):
+# they are copied from the build job when present and republished with the newest build.
+if [ -d "$STAGE" ]; then
+  if [ -d "$STAGE/license" ]; then
+    cp -r "$STAGE/license" "$DEST/"
+  fi
+  if [ -f "$STAGE/build-manifest.json" ]; then
+    cp "$STAGE/build-manifest.json" "$DEST/"
+  fi
 fi
 
 echo "staged archives in $DEST: $(find "$DEST" -maxdepth 1 -name "*.$EXT" | wc -l | tr -d ' ')"
@@ -107,6 +121,10 @@ for minor in $PHP_MINORS; do
 
   old=$(fetch_meta "$mm" || true)
   [ -n "$old" ] || old='{}'
+  # Metadata is keyed by minor line, so it may still describe the previous patch version.
+  # Inheriting from a different patch would relabel old artifacts as the new PHP version,
+  # so only reuse platform entries whose document carries the patch planned for this run.
+  old_ver=$(printf '%s' "$old" | jq -r '.["php-version"] // empty')
 
   platforms=$(printf '%s' "$STATE" | jq -r --arg c "$COMBO" --arg v "$ver" \
     '.[] | select(.combination == $c) | select(.["php-version"] == $v) | .platform')
@@ -114,7 +132,6 @@ for minor in $PHP_MINORS; do
   entries=$(mktemp)
   : >"$entries"
   info_file=""
-  max_rev=0
 
   for platform in $platforms; do
     st=$(printf '%s' "$STATE" | jq -c --arg c "$COMBO" --arg v "$ver" --arg p "$platform" \
@@ -151,14 +168,16 @@ for minor in $PHP_MINORS; do
 
       info="$STAGE/info-$ver-$platform.json"
       [ -f "$info" ] && info_file="$info"
-      [ "$rev" -gt "$max_rev" ] && max_rev=$rev
 
       jq -n --arg platform "$platform" --arg spctarget "$spctarget" --argjson rev "$rev" --argjson arts "$arts" \
         '{($platform): ({revision: $rev, "spc-target": (if $spctarget == "" then null else $spctarget end)} + $arts)}' >>"$entries"
       continue
     fi
 
-    prev=$(printf '%s' "$old" | jq -c --arg p "$platform" '.artifacts[$p] // empty' 2>/dev/null || true)
+    prev=""
+    if [ "$old_ver" = "$ver" ]; then
+      prev=$(printf '%s' "$old" | jq -c --arg p "$platform" '.artifacts[$p] // empty' 2>/dev/null || true)
+    fi
     if [ -n "$prev" ]; then
       jq -n --arg platform "$platform" --argjson prev "$prev" '{($platform): $prev}' >>"$entries"
       continue
@@ -168,16 +187,16 @@ for minor in $PHP_MINORS; do
       arts='{}'
       backfilled=1
       for sapi in $sapis; do
-        sha=$(remote_sha256 "$ver" 0 "$sfx" "$sapi")
+        sha=$(remote_sha256 "$ver" "$rev" "$sfx" "$sapi")
         [ -n "$sha" ] || { backfilled=0; break; }
-        f=$(file_name "$ver" 0 "$sfx" "$sapi")
+        f=$(file_name "$ver" "$rev" "$sfx" "$sapi")
         arts=$(jq --arg sapi "$sapi" --arg f "$f" --arg sha "$sha" \
           '. + {($sapi): {file: $f, sha256: $sha}}' <<<"$arts")
       done
       if [ "$backfilled" = 1 ]; then
         echo "backfilled metadata for php-$ver $platform from its .sha256 sidecars"
-        jq -n --arg platform "$platform" --arg spctarget "$spctarget" --argjson arts "$arts" \
-          '{($platform): ({revision: 0, "spc-target": (if $spctarget == "" then null else $spctarget end)} + $arts)}' >>"$entries"
+        jq -n --arg platform "$platform" --arg spctarget "$spctarget" --argjson rev "$rev" --argjson arts "$arts" \
+          '{($platform): ({revision: $rev, "spc-target": (if $spctarget == "" then null else $spctarget end)} + $arts)}' >>"$entries"
       else
         echo "::warning::php-$ver $platform is partially published and has no metadata yet; omitted from version_$mm.json" >&2
       fi
@@ -191,6 +210,10 @@ for minor in $PHP_MINORS; do
     echo "no complete artifact set for PHP $minor in $COMBO, skipping version_$mm.json"
     continue
   fi
+
+  # Derive the revision from the merged map, including platforms inherited from the previous
+  # metadata: a no-op publish must keep reporting the newest revision, not reset it to 0.
+  max_rev=$(printf '%s' "$arts_map" | jq -r '[.[].revision] | max // 0')
 
   revisions=$(printf '%s' "$arts_map" | jq -c '[.[].revision] | unique')
   old_revisions=$(printf '%s' "$old" | jq -c '.revisions // []')
@@ -212,9 +235,9 @@ for minor in $PHP_MINORS; do
   extra=$(printf '%s' "$first" | jq -r '.extra // ""')
   suggest=$(printf '%s' "$first" | jq -r '.suggest // ""')
   if [ "$WORKFLOW_KIND" = windows ]; then
-    build_command="bin/spc build --build-cli --build-micro \"$exts\" --debug $extra --dl-with-php=\"$minor\" --dl-retry=5"
+    build_command="bin/spc build --build-cli --build-micro \"$exts\" --debug $extra --dl-with-php=\"$ver\" --dl-retry=5"
   else
-    build_command="bin/spc build --build-cli --build-micro --build-fpm \"$exts\" --debug $extra $suggest --dl-with-php=\"$minor\" --dl-retry=5 --dl-prefer-binary --dl-ignore-cache=php-src"
+    build_command="bin/spc build --build-cli --build-micro --build-fpm \"$exts\" --debug $extra $suggest --dl-with-php=\"$ver\" --dl-retry=5 --dl-prefer-binary --dl-ignore-cache=php-src"
   fi
 
   label_json=null
