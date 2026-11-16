@@ -9,6 +9,9 @@
 #   PHP_MINORS     "8.2 8.3 8.4 8.5"
 #   STATE          state JSON emitted by the plan job (single line)
 #   LABEL          optional note recorded in the metadata of a forced republish
+#   FORCE          true | false      this run asked for a forced republish (revision + 1)
+#   TARGET_REVISION optional integer  this run asked to finish one specific revision
+#   STALE_FILE     optional override for the list of platforms left on their previous revision
 #   STAGE          defaults to stage (merged download-artifact directory)
 #   DEST           defaults to dist (this whole directory is uploaded to v3/php-bin/<combo>/)
 #   FAKE_OSS_DIR   optional, local tests
@@ -28,6 +31,18 @@ set -euo pipefail
 LABEL="${LABEL:-}"
 STAGE="${STAGE:-stage}"
 DEST="${DEST:-dist}"
+FORCE="${FORCE:-false}"
+TARGET_REVISION="${TARGET_REVISION:-}"
+
+# A run that explicitly asked to republish (force=true or a targeted revision) must never silently
+# keep a platform on its previous revision: collect those platforms so the workflow can fail the job
+# after the metadata that is still truthful has been uploaded.
+EXPLICIT_REPUBLISH=0
+if [ "$FORCE" = true ] || [ -n "$TARGET_REVISION" ]; then
+  EXPLICIT_REPUBLISH=1
+fi
+STALE_FILE="${STALE_FILE:-${RUNNER_TEMP:-/tmp}/publish-stale-${COMBO}.txt}"
+: >"$STALE_FILE"
 export LC_ALL=C
 
 case "$WORKFLOW_KIND" in
@@ -178,7 +193,14 @@ for minor in $PHP_MINORS; do
     if [ "$old_ver" = "$ver" ]; then
       prev=$(printf '%s' "$old" | jq -c --arg p "$platform" '.artifacts[$p] // empty' 2>/dev/null || true)
     fi
+    prev_rev=0
     if [ -n "$prev" ]; then
+      prev_rev=$(printf '%s' "$prev" | jq -r '.revision // 0' 2>/dev/null || echo 0)
+      case "$prev_rev" in '' | *[!0-9]*) prev_rev=0 ;; esac
+    fi
+
+    # Cheap no-op path: the published metadata already describes the planned revision.
+    if [ -n "$prev" ] && [ "$prev_rev" -eq "$rev" ]; then
       jq -n --arg platform "$platform" --argjson prev "$prev" '{($platform): $prev}' >>"$entries"
       continue
     fi
@@ -194,13 +216,28 @@ for minor in $PHP_MINORS; do
           '. + {($sapi): {file: $f, sha256: $sha}}' <<<"$arts")
       done
       if [ "$backfilled" = 1 ]; then
-        echo "backfilled metadata for php-$ver $platform from its .sha256 sidecars"
+        echo "backfilled metadata for php-$ver $platform (rev $rev) from its .sha256 sidecars"
         jq -n --arg platform "$platform" --arg spctarget "$spctarget" --argjson rev "$rev" --argjson arts "$arts" \
           '{($platform): ({revision: $rev, "spc-target": (if $spctarget == "" then null else $spctarget end)} + $arts)}' >>"$entries"
-      else
-        echo "::warning::php-$ver $platform is partially published and has no metadata yet; omitted from version_$mm.json" >&2
+        continue
+      fi
+      if [ -z "$prev" ]; then
+        echo "::warning::php-$ver $platform is marked as published at rev $rev but its sidecars are incomplete" >&2
       fi
     fi
+
+    if [ -n "$prev" ]; then
+      # The planned revision was not built (its build job failed): keep the last known good entry, but
+      # never let the run look as if the republish had covered this platform.
+      jq -n --arg platform "$platform" --argjson prev "$prev" '{($platform): $prev}' >>"$entries"
+      echo "::warning::php-$ver $platform: planned rev $rev is not available (no build in this run, or its sidecars are missing); metadata keeps rev $prev_rev" >&2
+      if [ "$EXPLICIT_REPUBLISH" = 1 ]; then
+        printf '%s: planned rev %s not built, still serving rev %s\n' "php-$ver $platform" "$rev" "$prev_rev" >>"$STALE_FILE"
+      fi
+      continue
+    fi
+
+    echo "::warning::php-$ver $platform is partially published and has no metadata yet; omitted from version_$mm.json" >&2
   done
 
   arts_map=$(jq -s 'add // {}' <"$entries")
@@ -286,7 +323,12 @@ jq -n --arg combination "$COMBO" --arg updated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" 
   echo
   echo "Published archives are immutable: a URL always keeps its bytes."
   echo "  rev 0: php-<ver>-<sapi>-<os>-<arch>.<ext>"
-  echo "  rev N: php-<ver>-N-<sapi>-<os>-<arch>.<ext>   (forced republish)"
+  echo "  rev N: php-<ver>-N-<sapi>-<os>-<arch>.<ext>   (forced or targeted republish)"
+  echo
+  echo "Revisions are tracked per platform: a republish whose build failed leaves that platform on"
+  echo "its previous revision. Always take the file name from artifacts.<platform>.<sapi>.file in"
+  echo "version_<MM>.json; the top level \"revision\" is the newest revision of the combination and"
+  echo "is not guaranteed to exist for every platform."
   echo
   echo "Machine-readable pointers, rewritten on every publish:"
   echo "  versions.json       latest PHP patch version per minor line"
@@ -298,10 +340,19 @@ jq -n --arg combination "$COMBO" --arg updated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" 
   printf '| %-8s | %-10s | %s\n' "-------" "----------" "----"
   printf '%s' "$index" | jq -r '.[] | "| \(.minor) | \(.["php-version"]) | \(.file) |"'
   echo
-  echo "Build command of the last write:"
+  echo "Build command of the last write (PHP $ver):"
   echo
   echo "    $(printf '%s' "$build_command")"
 } >"$DEST/README.txt"
+
+if [ -s "$STALE_FILE" ]; then
+  if [ "$EXPLICIT_REPUBLISH" = 1 ]; then
+    echo "::error::explicit republish is incomplete; these platforms keep their previous revision:" >&2
+  else
+    echo "::warning::these platforms keep their previous revision:" >&2
+  fi
+  sed 's/^/  /' "$STALE_FILE" >&2
+fi
 
 echo "publish staging for $COMBO:"
 ls -1 "$DEST" | sed 's/^/  /'

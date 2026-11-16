@@ -5,6 +5,10 @@
 #   WORKFLOW_KIND  unix | windows
 #   MODE           publish | verify
 #   FORCE          true | false          publish only: republish every target with revision + 1
+#   TARGET_REVISION optional integer 0..50
+#                                        publish only, mutually exclusive with FORCE: finish an existing
+#                                        revision instead of allocating a new one; only targets that are not
+#                                        complete at that revision are built
 #   PHP_MINORS     space separated, e.g. "8.2 8.3 8.4 8.5"
 #   OSS_BASE       https://dl.static-php.dev/v3/php-bin
 #   FAKE_OSS_DIR   optional, local tests: emulate the OSS bucket with a local directory, no network
@@ -18,6 +22,11 @@
 #   verify  - do not probe the bucket, matrix = everything (build-only self check, no upload)
 #   publish - skip when the full remote set (archive + .sha256) exists; otherwise publish rev 0
 #             (never published before) or the next free rev N (partial set or forced republish). Artifacts are never overwritten.
+#   publish + TARGET_REVISION=N
+#           - repair instead of bump: targets complete at N are skipped (the publish job backfills their
+#             metadata from the immutable .sha256 sidecars), incomplete ones are built at N.
+#           - refuses a revision that is partially occupied (two builds must never share a revision)
+#             or older than a revision that is already published (revisions record build recency).
 set -euo pipefail
 
 : "${WORKFLOW_KIND:?WORKFLOW_KIND required (unix|windows)}"
@@ -25,12 +34,34 @@ set -euo pipefail
 : "${PHP_MINORS:?PHP_MINORS required}"
 : "${OSS_BASE:?OSS_BASE required}"
 FORCE="${FORCE:-false}"
+TARGET_REVISION="${TARGET_REVISION:-}"
+
+if [ -n "$TARGET_REVISION" ]; then
+  case "$TARGET_REVISION" in
+    *[!0-9]*) echo "::error::TARGET_REVISION must be a non-negative integer, got '$TARGET_REVISION'" >&2; exit 1 ;;
+  esac
+  if [ "$TARGET_REVISION" -gt 50 ]; then
+    echo "::error::TARGET_REVISION must be <= 50, got '$TARGET_REVISION'" >&2; exit 1
+  fi
+  if [ "$MODE" != publish ]; then
+    echo "::error::TARGET_REVISION is only valid in publish mode (mode=$MODE)" >&2; exit 1
+  fi
+  if [ "$FORCE" = true ]; then
+    echo "::error::TARGET_REVISION cannot be combined with force=true (force allocates the next revision, TARGET_REVISION finishes an existing one)" >&2; exit 1
+  fi
+  echo "::notice::finishing revision $TARGET_REVISION: only targets that are not complete at that revision will be built"
+fi
 
 export LC_ALL=C
 
 # An unknown remote state (000/5xx/429) must not be treated as "missing"; accumulate it here and fail hard at the end.
 ERRLOG="$(mktemp)"
 : >"$ERRLOG"
+
+# Unsafe TARGET_REVISION requests (partially occupied revision, revision older than an existing one).
+# Unlike ERRLOG these are not "cannot tell": the request itself is refused before anything is built.
+REFUSELOG="$(mktemp)"
+: >"$REFUSELOG"
 
 # ------------------------------------------------------------------ static tables
 
@@ -193,6 +224,14 @@ next_free_rev() { # combo ver suffix
   printf '0'
 }
 
+# Whether any newer revision is already published. Revisions are allocated contiguously (next_free_rev
+# and find_complete_rev both assume that), so probing the next one is enough and keeps this cheap.
+has_newer_rev() { # combo ver suffix rev
+  local combo=$1 ver=$2 sfx=$3 rev=$4
+  [ "$rev" -lt 50 ] || return 1
+  any_object "$combo" "$ver" "$((rev + 1))" "$sfx"
+}
+
 # ------------------------------------------------------------------ resolve PHP versions
 
 # FAKE_PHP_VERSIONS="8.2=8.2.29 8.3=8.3.26" skips php.net (local tests only)
@@ -232,13 +271,13 @@ lookup_ver() {
 matrix="$(mktemp)"
 state="$(mktemp)"
 all="$(mktemp)"
-trap 'rm -f "$matrix" "$state" "$all" "$ERRLOG"' EXIT
+trap 'rm -f "$matrix" "$state" "$all" "$ERRLOG" "$REFUSELOG"' EXIT
 : >"$matrix"
 : >"$state"
 : >"$all"
 
-export OSS_BASE WORKFLOW_KIND MODE FORCE VERSIONS ERRLOG
-export -f extensions_for suggest_for sapis_for archive_ext http_code status file_name url_of set_complete any_object find_complete_rev next_free_rev
+export OSS_BASE WORKFLOW_KIND MODE FORCE VERSIONS ERRLOG REFUSELOG TARGET_REVISION
+export -f extensions_for suggest_for sapis_for archive_ext http_code status file_name url_of set_complete any_object find_complete_rev next_free_rev has_newer_rev
 
 plan_one() {
   local row=$1 combo platform runner os arch sfx spctarget extra minor ver action revision ext sapis
@@ -250,6 +289,21 @@ plan_one() {
 
   if [ "$MODE" = verify ]; then
     action=build
+  elif [ -n "$TARGET_REVISION" ]; then
+    # Targeted repair: finish exactly this revision instead of allocating a new one.
+    revision=$TARGET_REVISION
+    if set_complete "$combo" "$ver" "$revision" "$sfx"; then
+      # Already published in full: nothing to build, the publish job backfills the metadata entry.
+      action=skip
+    elif any_object "$combo" "$ver" "$revision" "$sfx"; then
+      echo "::error::$combo php-$ver $sfx: revision $revision is partially occupied; refusing to mix two builds in one revision" >&2
+      printf '%s\n' "partially occupied: $combo php-$ver $sfx rev $revision" >>"$REFUSELOG"
+    elif has_newer_rev "$combo" "$ver" "$sfx" "$revision"; then
+      echo "::error::$combo php-$ver $sfx: revision $revision is older than an already published revision; refusing to publish older bytes under a newer revision" >&2
+      printf '%s\n' "older than existing: $combo php-$ver $sfx rev $revision" >>"$REFUSELOG"
+    else
+      action=publish
+    fi
   else
     complete=$(find_complete_rev "$combo" "$ver" "$sfx")
     if [ -n "$complete" ]; then
@@ -346,6 +400,12 @@ rm -f "$matrix.rows"
 if [ -s "$ERRLOG" ]; then
   echo "::error::could not determine the published state of $(wc -l <"$ERRLOG" | tr -d ' ') URL(s); refusing to publish anything this run" >&2
   head -n 5 "$ERRLOG" >&2
+  exit 1
+fi
+
+if [ -s "$REFUSELOG" ]; then
+  echo "::error::refusing to publish: $(wc -l <"$REFUSELOG" | tr -d ' ') target(s) failed the revision pre-check" >&2
+  head -n 5 "$REFUSELOG" >&2
   exit 1
 fi
 

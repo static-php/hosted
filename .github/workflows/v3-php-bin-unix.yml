@@ -3,10 +3,14 @@ name: "[v3] Build Self-Hosted PHP Binary (Unix)"
 # Modes (resolved by the plan job):
 #   verify  - every 3 days via cron: full rebuild, only to prove that the spc on the v3 branch still builds; nothing is uploaded
 #   publish - every Sunday via cron, or manually: build only the (PHP version, platform) targets that are missing remotely, then publish incrementally
+#   publish + revision=N - manual recovery: finish revision N instead of allocating a new one; only the
+#             targets that are not complete at N are built (force=false, mutually exclusive with force)
 #
 # Published artifacts are never overwritten:
 #   rev 0 = php-<ver>-<sapi>-<suffix>.<ext>        (first publication, bare file name)
-#   rev N = php-<ver>-N-<sapi>-<suffix>.<ext>      (forced republish, N increases monotonically)
+#   rev N = php-<ver>-N-<sapi>-<suffix>.<ext>      (forced or targeted republish)
+#   Revisions are tracked per platform; the top level "revision" is the newest revision of the
+#   combination and is not guaranteed to exist for every platform (see version_<MM>.json).
 # Metadata is written by the single writer in the publish job, so there is no read-modify-write race:
 #   v3/php-bin/<combo>/versions.json
 #   v3/php-bin/<combo>/version_<MM>.json
@@ -28,6 +32,10 @@ on:
         default: false
       label:
         description: "Optional note recorded in the metadata of a forced republish (e.g. openssl-cve-2026-1234)"
+        type: string
+        default: ""
+      revision:
+        description: "publish only, cannot be combined with force: finish this exact revision (0-50) instead of allocating a new one; leave empty for a normal incremental publish"
         type: string
         default: ""
   schedule:
@@ -75,6 +83,7 @@ jobs:
         env:
           MODE: ${{ steps.mode.outputs.mode }}
           FORCE: ${{ inputs.force }}
+          TARGET_REVISION: ${{ inputs.revision }}
         run: bash .github/scripts/php-bin-plan.sh
 
   build:
@@ -266,6 +275,8 @@ jobs:
           COMBO: ${{ matrix.combination }}
           STATE: ${{ needs.plan.outputs.state }}
           LABEL: ${{ inputs.label }}
+          FORCE: ${{ inputs.force }}
+          TARGET_REVISION: ${{ inputs.revision }}
         run: bash .github/scripts/php-bin-publish.sh
 
       - name: "Deploy to self-hosted OSS"
@@ -277,3 +288,15 @@ jobs:
           source_dir: "dist/"
           destination_dir: v3/php-bin/${{ matrix.combination }}/
           endpoint: ${{ secrets.AWS_ENDPOINT }}
+
+      - name: "Fail on incomplete explicit republish"
+        # The metadata written above is truthful and already uploaded; make the run red so a forced or
+        # targeted republish that left a platform behind cannot be mistaken for a clean one.
+        if: always()
+        run: |
+          set -euo pipefail
+          stale="${RUNNER_TEMP:-/tmp}/publish-stale-${{ matrix.combination }}.txt"
+          [ -s "$stale" ] || exit 0
+          echo "::error::forced or targeted republish is incomplete for:"
+          sed 's/^/  /' "$stale"
+          exit 1

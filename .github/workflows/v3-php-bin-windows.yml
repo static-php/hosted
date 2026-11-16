@@ -3,6 +3,8 @@ name: "[v3] Build Self-Hosted PHP Binary (Windows)"
 # Same semantics and scripts as the unix workflow (plan/publish run on ubuntu, only build runs on windows):
 #   verify  - every 3 days via cron: full build-only self check, nothing is uploaded
 #   publish - every Sunday via cron or when dispatched: build only the targets that are missing remotely
+#   publish + revision=N - manual recovery: finish revision N instead of allocating a new one; only the
+#             targets that are not complete at N are built (force=false, mutually exclusive with force)
 # Artifacts: php-<ver>[-N]-<sapi>-win.zip (sapi = cli / micro)
 # Metadata: v3/php-bin/<combo>/version_<MM>.json, versions.json, README.txt
 
@@ -22,6 +24,10 @@ on:
         default: false
       label:
         description: "Optional note recorded in the metadata of a forced republish"
+        type: string
+        default: ""
+      revision:
+        description: "publish only, cannot be combined with force: finish this exact revision (0-50) instead of allocating a new one; leave empty for a normal incremental publish"
         type: string
         default: ""
   schedule:
@@ -69,6 +75,7 @@ jobs:
         env:
           MODE: ${{ steps.mode.outputs.mode }}
           FORCE: ${{ inputs.force }}
+          TARGET_REVISION: ${{ inputs.revision }}
         run: bash .github/scripts/php-bin-plan.sh
 
   build:
@@ -252,6 +259,8 @@ jobs:
           COMBO: ${{ matrix.combination }}
           STATE: ${{ needs.plan.outputs.state }}
           LABEL: ${{ inputs.label }}
+          FORCE: ${{ inputs.force }}
+          TARGET_REVISION: ${{ inputs.revision }}
         run: bash .github/scripts/php-bin-publish.sh
 
       - name: "Deploy to self-hosted OSS"
@@ -263,3 +272,15 @@ jobs:
           source_dir: "dist/"
           destination_dir: v3/php-bin/${{ matrix.combination }}/
           endpoint: ${{ secrets.AWS_ENDPOINT }}
+
+      - name: "Fail on incomplete explicit republish"
+        # The metadata written above is truthful and already uploaded; make the run red so a forced or
+        # targeted republish that left a platform behind cannot be mistaken for a clean one.
+        if: always()
+        run: |
+          set -euo pipefail
+          stale="${RUNNER_TEMP:-/tmp}/publish-stale-${{ matrix.combination }}.txt"
+          [ -s "$stale" ] || exit 0
+          echo "::error::forced or targeted republish is incomplete for:"
+          sed 's/^/  /' "$stale"
+          exit 1
